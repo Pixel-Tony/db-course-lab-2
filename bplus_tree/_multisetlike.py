@@ -1,32 +1,24 @@
 from abc import ABCMeta as __ABCMeta, abstractmethod as _abstract
-from typing import Iterable, Literal, Generic, Iterator, Sized, TypeVar, Callable
-from ._bases import ComparableKeyT, IMultiKeyBpT
+from typing import Iterable, Generic, Iterator, TypeVar
+from ._bases import (ComparableKeyT, IMultiKeyBpT, FormatterT as _FormatterT,
+                     HasherT as _HasherT)
 from dataclasses import dataclass
+
+
+__all__ = ['MultiKeyBplusTree']
 
 
 _KT = TypeVar('_KT', bound='ComparableKeyT')
 _VT = TypeVar('_VT')
-_T = TypeVar('_T')
-FormatterT = Callable[[_T], str]
-HasherT = Callable[[_VT], _KT]
 _NodeT = TypeVar('_NodeT', covariant=True)
 
 
 @dataclass(eq=False, slots=True)
 class _RemovalResult(Generic[_KT, _VT]):
-    # * If no join was made:
-    #     - KeyT: smallest key, if changed.
-    # * If joined with neighbor:
-    #     - node: result of a join, current if joined with the right neighbor,
-    #       previous node if joined with the left;
-    #     - KeyT: #TODO if joined with the right neighbor...,
-    #                 , if joined with the left...
-
-    """The class representing result of a 'remove' operation on the node."""
+    """The class representing result of a removal operation on the node."""
     removed: bool
     """Whether the key was removed."""
-    join_result: \
-        'AnyNodeT[_KT, _VT] | None' = None
+    join_result: '_AnyNodeT[_KT, _VT] | None' = None
     """Result of the join if siblings were joined in the process."""
     smallest_key: _KT | None = None
     """New smallest key of the node if it changed."""
@@ -35,20 +27,23 @@ class _RemovalResult(Generic[_KT, _VT]):
 
 
 @dataclass(eq=False, slots=True)
-class _AnyNode(Generic[_KT, _VT, _NodeT], Sized, metaclass=__ABCMeta):
+class _AnyNode(Generic[_KT, _VT, _NodeT], metaclass=__ABCMeta):
     _left: _NodeT | None
     _right: _NodeT | None
 
     @_abstract
-    def trim(self) -> 'AnyNodeT[_KT, _VT]': ...
+    def __len__(self) -> int: ...
+
+    @_abstract
+    def trim(self) -> '_AnyNodeT[_KT, _VT]': ...
 
     @property
     @_abstract
     def smallest_key(self) -> _KT: ...
 
     @_abstract
-    def to_str(self, k_format: FormatterT[_KT],
-               v_format: FormatterT[_VT], indent: int, /) -> str: ...
+    def to_str(self, k_format: _FormatterT[_KT],
+               v_format: _FormatterT[_VT], indent: int, /) -> str: ...
 
     @_abstract
     def has(self, key: _KT, value: _VT, /) -> bool: ...
@@ -65,11 +60,11 @@ class _AnyNode(Generic[_KT, _VT, _NodeT], Sized, metaclass=__ABCMeta):
 
     # TODO FUTURE: support for multiple keys removal in-place
     @_abstract
-    def remove(self, key: _KT, value: _VT, root: bool, order: int,
+    def remove(self, key: _KT, value: _VT, root: bool, halforder: int,
                can_join: tuple[bool, bool], /) -> _RemovalResult[_KT, _VT]: ...
 
 
-AnyNodeT = _AnyNode[_KT, _VT, 'AnyNodeT[_KT, _VT]']
+_AnyNodeT = _AnyNode[_KT, _VT, '_AnyNodeT[_KT, _VT]']
 
 
 # TODO comment asserts; use binary search for child
@@ -130,8 +125,8 @@ class _Leaf(_AnyNode[_KT, _VT, '_Leaf[_KT, _VT]']):
 
         return count + 1
 
-    def to_str(self, key_format: FormatterT[_KT],
-               value_format: FormatterT[_VT], indent: int, /):
+    def to_str(self, key_format: _FormatterT[_KT],
+               value_format: _FormatterT[_VT], indent: int, /):
         return ' '*indent + f"\n{' '*indent}".join(
             f"{key_format(k)}: {value_format(v)}"
             for k, v in self.__pairs
@@ -155,7 +150,7 @@ class _Leaf(_AnyNode[_KT, _VT, '_Leaf[_KT, _VT]']):
                         for k, v in self.__pairs
                         if k < key or (k == key and v != value))
 
-    def remove(self, key: _KT, value: _VT, root: bool, order: int,
+    def remove(self, key: _KT, value: _VT, root: bool, halforder: int,
                can_join: tuple[bool, bool], /) -> _RemovalResult[_KT, _VT]:
         target = key, value
         inds = [i for i, p in enumerate(self.__pairs) if p == target]
@@ -174,25 +169,24 @@ class _Leaf(_AnyNode[_KT, _VT, '_Leaf[_KT, _VT]']):
             return _RemovalResult(True, None, smallest_key)
 
         count = len(self)
-        half = order // 2
-        if count >= half:
+        if count >= halforder:
             return _RemovalResult(True, None, smallest_key)
 
         left, right = self._left, self._right
 
         if can_join[1] and right:
-            if len(right) > half:
+            if len(right) > halforder:
                 self._keys.append(right._keys.pop(0))
                 self._values.append(right._values.pop(0))
                 return _RemovalResult(True, None, smallest_key, right._keys[0])
 
-            if left is None or not can_join[0] or len(left) == half:
+            if left is None or not can_join[0] or len(left) == halforder:
                 self._join_from(right)
                 return _RemovalResult(True, self, smallest_key)
 
         assert left
 
-        if len(left) > half:
+        if len(left) > halforder:
             smallest_key = left._keys.pop()
             self._keys.insert(0, smallest_key)
             self._values.insert(0, left._values.pop())
@@ -212,7 +206,7 @@ class _Leaf(_AnyNode[_KT, _VT, '_Leaf[_KT, _VT]']):
 @dataclass(eq=False, slots=True)
 class _Node(_AnyNode[_KT, _VT, '_Node[_KT, _VT]']):
     _bounds: list[_KT]
-    _children: list[AnyNodeT[_KT, _VT]]
+    _children: list[_AnyNodeT[_KT, _VT]]
 
     def __len__(self):
         return len(self._children)
@@ -261,8 +255,8 @@ class _Node(_AnyNode[_KT, _VT, '_Node[_KT, _VT]']):
             old_right._left = self._right
         return self._right, mid
 
-    def to_str(self, key_format: FormatterT[_KT],
-               value_format: FormatterT[_VT], indent: int):
+    def to_str(self, key_format: _FormatterT[_KT],
+               value_format: _FormatterT[_VT], indent: int):
         formats = key_format, value_format
         IND = ' ' * indent
         return (
@@ -322,7 +316,7 @@ class _Node(_AnyNode[_KT, _VT, '_Node[_KT, _VT]']):
                     if bounds[i - 1] <= key < bounds[i])
         return range(i_mn, i_mx)
 
-    def remove(self, key: _KT, value: _VT, root: bool, order: int,
+    def remove(self, key: _KT, value: _VT, root: bool, halforder: int,
                can_join: tuple[bool, bool], /) -> _RemovalResult[_KT, _VT]:
         if not self._children:
             return _RemovalResult(False)
@@ -330,15 +324,17 @@ class _Node(_AnyNode[_KT, _VT, '_Node[_KT, _VT]']):
         MAX = len(self) - 1
         for i in self._children_range_containing(key):
             child = self._children[i]
-            result = child.remove(key, value, False, order, (i > 0, i < MAX))
-            if result.removed:
-                return self._remove(root, child, i, result, can_join, order)
+            cans_joins = i > 0, i < MAX
+            result = child.remove(key, value, False, halforder, cans_joins)
+            if not result.removed:
+                continue
+            return self._remove(root, child, i, result, can_join, halforder)
 
         return _RemovalResult(False)
 
-    def _remove(self, root: bool, child: AnyNodeT[_KT, _VT], i: int,
+    def _remove(self, root: bool, child: _AnyNodeT[_KT, _VT], i: int,
                 result: _RemovalResult[_KT, _VT], can_join: tuple[bool, bool],
-                order: int, /) -> _RemovalResult[_KT, _VT]:
+                halforder: int, /) -> _RemovalResult[_KT, _VT]:
 
         if result.right_smallest_key:
             self._bounds[i] = result.right_smallest_key
@@ -355,27 +351,27 @@ class _Node(_AnyNode[_KT, _VT, '_Node[_KT, _VT]']):
         self._children.pop(offset)
         self._bounds.pop(offset - 1)
 
-        half = order // 2
-        if root or len(self) >= half:
+        if root or len(self) >= halforder:
             return _RemovalResult(True, None, smallest_key)
 
         left, right = self._left, self._right
 
         if can_join[1] and right:
-            if len(right) > half:
+            if len(right) > halforder:
                 to_append = right._children.pop(0)
+                right_smallest_key = right._bounds.pop(0)
                 self._children.append(to_append)
                 self._bounds.append(to_append.smallest_key)
                 return _RemovalResult(True, None, smallest_key,
-                                      right._bounds.pop(0))
+                                      right_smallest_key)
 
-            if left is None or not can_join[0] or len(left) == half:
+            if left is None or not can_join[0] or len(left) == halforder:
                 self._join_from(right)
                 return _RemovalResult(True, self, smallest_key)
 
-        assert left and can_join[0], [bool(left), can_join[0]]
+        assert left and can_join[0]
 
-        if len(left) > half:
+        if len(left) > halforder:
             to_append = left._children.pop()
             left._bounds.pop()
             bound = self._children[0].smallest_key
@@ -396,44 +392,42 @@ class _Node(_AnyNode[_KT, _VT, '_Node[_KT, _VT]']):
             self._right._left = self
 
 
-class MultiSetBplusTree(IMultiKeyBpT[_KT, _VT]):
+class MultiKeyBplusTree(IMultiKeyBpT[_KT, _VT]):
     """B+ tree implementation with support for repeated values."""
-    __root: AnyNodeT[_KT, _VT]
 
-    def __init__(self, order: int, keygen: HasherT[_VT, _KT]):
+    def __init__(self, order: int, keygen: _HasherT[_VT, _KT]):
         assert not (order % 2), 'Order of the B+ tree must be an even number'
-        self.__order = order
-        self.__keygen = keygen
-        self.__root = _Leaf(None, None, [], [])
+        assert order > 2, 'Order of the B+ tree must be bigger than 2'
 
-    def insert(self, value: _VT) -> Literal[True]:
-        another = self.__root.insert(self.__keygen(value), value,
-                                     self.__order)
+        self._order = order
+        self._keygen = keygen
+        self._root: _AnyNodeT[_KT, _VT] = _Leaf(None, None, [], [])
+
+    def insert(self, value: _VT, /):
+        another = self._root.insert(self._keygen(value), value, self._order)
         if another is None:
             return True
         neighbor, border = another
 
-        self.__root = _Node(None, None, [border],
-                            [self.__root, neighbor])
+        self._root = _Node(None, None, [border], [self._root, neighbor])
         return True
 
-    def to_str(self, key_format: FormatterT[_KT] = str,
-               value_format: FormatterT[_VT] = str):
-        return self.__root.to_str(key_format, value_format, 0)
+    def to_str(self, key_format: _FormatterT[_KT] = str,
+               value_format: _FormatterT[_VT] = str):
+        return self._root.to_str(key_format, value_format, 0)
 
     def has(self, value: _VT) -> bool:
-        return self.__root.has(self.__keygen(value), value)
+        return self._root.has(self._keygen(value), value)
 
     def remove(self, value: _VT) -> bool:
-        key = self.__keygen(value)
-        no_joins = False, False
-        result = self.__root.remove(key, value, True, self.__order, no_joins)
-
-        self.__root = self.__root.trim()
+        key = self._keygen(value)
+        halforder = self._order // 2
+        result = self._root.remove(key, value, True, halforder, (False, False))
+        self._root = self._root.trim()
         return result.removed
 
     def all_less_than(self, value: _VT) -> Iterator[_VT]:
-        return self.__root.all_less_than(self.__keygen(value), value)
+        return self._root.all_less_than(self._keygen(value), value)
 
     def all_bigger_than(self, value: _VT) -> Iterator[_VT]:
-        return self.__root.all_bigger_than(self.__keygen(value), value)
+        return self._root.all_bigger_than(self._keygen(value), value)
